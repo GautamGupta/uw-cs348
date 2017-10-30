@@ -1,0 +1,170 @@
+#include <stdio.h>              // printf
+#include <stdlib.h>             // exit
+#include <string.h>             // strcpy, strlen
+#include "util.h"
+
+// Part of it borrowed from sample https://cs.uwaterloo.ca/~david/cs348/samples-esql-db2/adhoc.sqc
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+  // char types are +1 in size to accommodate \0
+  char db[6] = "cs348";
+  char input_pubid[11];
+  char pub_pubid[11];
+  char pub_title[71];
+  sqlint32 pub_year;              // only journal, proceedings, article
+  char pub_author_name[23];
+  char book_publisher[51];
+  sqlint32 journal_volume;
+  sqlint32 journal_number;
+  char article_appearsin[11];
+  sqlint32 article_startpage;
+  sqlint32 article_endpage;
+EXEC SQL END DECLARE SECTION;
+
+enum PUB_TYPE {BOOK = 0, JOURNAL, PROCEEDINGS, ARTICLE};
+typedef enum PUB_TYPE PUB_TYPE;
+const char *pub_type_names[] = {"book", "journal", "proceedings", "article"};
+
+PUB_TYPE load_publication() {
+  EXEC SQL
+    SELECT title INTO :pub_title
+    FROM publication
+    WHERE pubid = :pub_pubid;
+
+  EXEC SQL
+    SELECT publisher, year
+    INTO :book_publisher, :pub_year
+    FROM book
+    WHERE pubid = :pub_pubid;
+
+  if (SQLCODE == 0) return BOOK;
+
+  EXEC SQL
+    SELECT volume, number, year
+    INTO :journal_volume, :journal_number, :pub_year
+    FROM journal
+    WHERE pubid = :pub_pubid;
+
+  if (SQLCODE == 0) return JOURNAL;
+
+  EXEC SQL
+    SELECT year INTO :pub_year
+    FROM proceedings
+    WHERE pubid = :pub_pubid;
+
+  if (SQLCODE == 0) return PROCEEDINGS;
+
+  EXEC SQL
+    SELECT appearsin, startpage, endpage
+    INTO :article_appearsin, :article_startpage, :article_endpage
+    FROM article
+    WHERE pubid = :pub_pubid;
+
+  if (SQLCODE == 0) return ARTICLE;
+
+  exit(EXIT_FAILURE); // Should not happen
+}
+
+void print_authors() {
+  EXEC SQL DECLARE C_AUTHORS CURSOR FOR
+    SELECT rtrim(A.name) as name
+    FROM author AS A, wrote AS W
+    WHERE A.aid = W.aid
+      AND W.pubid = :pub_pubid
+    ORDER BY W.aorder ASC;
+  EXEC SQL OPEN C_AUTHORS;
+
+  printf("Authors: ");
+  for (int i = 0; ; i++) {
+      EXEC SQL FETCH C_AUTHORS INTO :pub_author_name;
+      if (SQLCODE == 100) break;
+      if (i > 0) printf(", ");
+      printf("%s", pub_author_name);
+  }
+  printf("\n");
+
+  EXEC SQL CLOSE C_AUTHORS;
+}
+
+void print_pub(PUB_TYPE type) {
+  printf("Pubid: %s\n", pub_pubid);
+  printf("Type: %s\n", pub_type_names[type]);
+  printf("Title: %s\n", pub_title);
+
+  switch (type) {
+    case BOOK:
+      print_authors();
+      printf("Publisher: %s\n", book_publisher);
+      printf("Year: %d\n", pub_year);
+      break;
+    case JOURNAL:
+      printf("Volume: %d\n", journal_volume);
+      printf("Number: %d\n", journal_number);
+      printf("Year: %d\n", pub_year);
+      break;
+    case PROCEEDINGS:
+      printf("Year: %d\n", pub_year);
+      break;
+    case ARTICLE:
+      print_authors();
+      printf("In: %s\n", article_appearsin);
+      printf("Pages: %d--%d\n", article_startpage, article_endpage);
+      break;
+  }
+
+  printf("\n");
+}
+
+void print_publications() {
+  EXEC SQL DECLARE C_PUBLICATIONS CURSOR FOR
+    SELECT a.pubid
+    FROM article AS a
+    WHERE a.appearsin = :input_pubid
+    ORDER BY a.startpage ASC;
+  EXEC SQL OPEN C_PUBLICATIONS;
+
+  for (;;) {
+    EXEC SQL FETCH C_PUBLICATIONS INTO :pub_pubid;
+    if (SQLCODE == 100) break;
+    PUB_TYPE pub_type = load_publication();
+    print_pub(pub_type);
+  }
+
+  EXEC SQL CLOSE C_PUBLICATIONS;
+}
+
+void usage(char *argv[]) {
+    printf("Usage: %s PubId\n", argv[0]);
+    printf("len(PubId) <= 10\n");
+    exit(EXIT_FAILURE);
+}
+
+int main(int argc, char *argv[]) {
+  /* Command line arg */
+  if (argc != 2 || strlen(argv[1]) > 10) {
+    usage(argv);
+  }
+  strcpy(input_pubid, argv[1]);
+
+  /* bail out on error */
+  EXEC SQL WHENEVER SQLERROR  GO TO error;
+
+  /* connect to the database */
+  EXEC SQL CONNECT TO :db;
+
+  print_publications();
+
+  EXEC SQL COMMIT;
+  EXEC SQL CONNECT reset;
+  exit(0);
+
+error:
+  check_error("My error", &sqlca);
+  EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+  EXEC SQL ROLLBACK;
+  EXEC SQL CONNECT reset;
+  exit(EXIT_FAILURE);
+}
