@@ -1,0 +1,267 @@
+#include <stdio.h>              // printf
+#include <stdlib.h>             // exit
+#include <string.h>             // strcpy, strlen, strtok
+#include "util.h"
+
+#define BUF_SIZE 4096
+
+// Part of it borrowed from sample https://cs.uwaterloo.ca/~david/cs348/samples-esql-db2/adhoc.sqc
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+  // char types are +1 in size to accommodate \0
+  char db[6] = "cs348";
+  sqlint32 author_id;
+  char author_name[23];
+  char author_url[43];
+  sqlint32 wrote_aorder;
+  char pubid[11];
+  char pub_title[71];
+  sqlint32 pub_year;              // only journal, proceedings, article
+  char book_publisher[51];
+  sqlint32 journal_volume;
+  sqlint32 journal_number;
+  char article_appearsin[11];
+  sqlint32 article_startpage;
+  sqlint32 article_endpage;
+EXEC SQL END DECLARE SECTION;
+
+enum PUB_TYPE {BOOK = 0, JOURNAL, PROCEEDINGS, ARTICLE};
+typedef enum PUB_TYPE PUB_TYPE;
+const char *pub_type_names[] = {"book", "journal", "proceedings", "article"};
+
+PUB_TYPE load_publication() {
+  EXEC SQL
+    SELECT title INTO :pub_title
+    FROM publication
+    WHERE pubid = :pubid;
+
+  EXEC SQL
+    SELECT publisher, year
+    INTO :book_publisher, :pub_year
+    FROM book
+    WHERE pubid = :pubid;
+
+  if (SQLCODE == 0) return BOOK;
+
+  EXEC SQL
+    SELECT volume, number, year
+    INTO :journal_volume, :journal_number, :pub_year
+    FROM journal
+    WHERE pubid = :pubid;
+
+  if (SQLCODE == 0) return JOURNAL;
+
+  EXEC SQL
+    SELECT year INTO :pub_year
+    FROM proceedings
+    WHERE pubid = :pubid;
+
+  if (SQLCODE == 0) return PROCEEDINGS;
+
+  EXEC SQL
+    SELECT appearsin, startpage, endpage
+    INTO :article_appearsin, :article_startpage, :article_endpage
+    FROM article
+    WHERE pubid = :pubid;
+
+  if (SQLCODE == 0) return ARTICLE;
+
+  exit(EXIT_FAILURE); // Should not happen
+}
+
+void print_authors() {
+  EXEC SQL DECLARE C_AUTHORS CURSOR FOR
+    SELECT rtrim(A.name) as name
+    FROM author AS A, wrote AS W
+    WHERE A.aid = W.aid
+      AND W.pubid = :pubid
+    ORDER BY W.aorder ASC;
+  EXEC SQL OPEN C_AUTHORS;
+
+  printf("Authors: ");
+  for (int i = 0; ; i++) {
+      EXEC SQL FETCH C_AUTHORS INTO :author_name;
+      if (SQLCODE == 100) break;
+      if (i > 0) printf(", ");
+      printf("%s", author_name);
+  }
+  printf("\n");
+
+  EXEC SQL CLOSE C_AUTHORS;
+}
+
+void print_pub() {
+  PUB_TYPE type = load_publication();
+
+  printf("Pubid: %s\n", pubid);
+  printf("Type: %s\n", pub_type_names[type]);
+  printf("Title: %s\n", pub_title);
+
+  switch (type) {
+    case BOOK:
+      print_authors();
+      printf("Publisher: %s\n", book_publisher);
+      printf("Year: %d\n", pub_year);
+      break;
+    case JOURNAL:
+      printf("Volume: %d\n", journal_volume);
+      printf("Number: %d\n", journal_number);
+      printf("Year: %d\n", pub_year);
+      break;
+    case PROCEEDINGS:
+      printf("Year: %d\n", pub_year);
+      break;
+    case ARTICLE:
+      print_authors();
+      printf("In: %s\n", article_appearsin);
+      printf("Pages: %d--%d\n", article_startpage, article_endpage);
+      break;
+  }
+
+  printf("\n");
+}
+
+void process_authors(char *authors) {
+  char *parsed_id;
+  parsed_id = strtok(authors, ";");
+
+  for (wrote_aorder = 1; parsed_id != NULL; wrote_aorder++) {
+    author_id = atoi(parsed_id);
+    EXEC SQL INSERT INTO WROTE
+      VALUES (:author_id, :pubid, :wrote_aorder);
+    parsed_id = strtok(NULL, ";");
+  }
+}
+
+void usage(char *argv[]) {
+    printf("Usage: %s\n", argv[0]);
+    exit(EXIT_FAILURE);
+}
+
+int main(int argc, char *argv[]) {
+  /* Command line arg */
+  if (argc != 1) {
+    usage(argv);
+  }
+
+  /* bail out on error */
+  EXEC SQL WHENEVER SQLERROR  GO TO error;
+
+  /* connect to the database */
+  EXEC SQL CONNECT TO :db;
+
+  size_t bufsize = BUF_SIZE;
+  char *buffer = (char *) malloc(bufsize * sizeof(char));
+  if (buffer == NULL) goto error;
+
+  while (getline(&buffer, &bufsize, stdin) != -1) {
+    char *insert_type = strtok(buffer, "(");
+    char *authors = (char *) malloc(bufsize * sizeof(char));
+
+    if (strcmp(insert_type, "author") == 0) {
+      author_id = atoi(strtok(NULL, "#"));
+      strcpy(author_name, strtok(NULL, ")"));
+
+      EXEC SQL
+        INSERT INTO author (aid, name)
+          VALUES (:author_id, :author_name);
+
+    } else if (strcmp(insert_type, "authorurl") == 0) {
+      author_id = atoi(strtok(NULL, "#"));
+      strcpy(author_url, strtok(NULL, ")"));
+
+      EXEC SQL
+        UPDATE author
+          SET url = :author_url
+        WHERE aid = :author_id;
+
+    } else if (strcmp(insert_type, "book") == 0) {
+      strcpy(pubid, strtok(NULL, "#"));
+      strcpy(pub_title, strtok(NULL, "#"));
+      strcpy(authors, strtok(NULL, "#"));
+      strcpy(book_publisher, strtok(NULL, "#"));
+      pub_year = atoi(strtok(NULL, ")"));
+
+      EXEC SQL
+        INSERT INTO publication
+          VALUES (:pubid, :pub_title);
+
+      EXEC SQL
+        INSERT INTO book
+          VALUES (:pubid, :book_publisher, :pub_year);
+
+      process_authors(authors);
+
+      print_pub();
+
+    } else if (strcmp(insert_type, "journal") == 0) {
+      strcpy(pubid, strtok(NULL, "#"));
+      strcpy(pub_title, strtok(NULL, "#"));
+      journal_volume = atoi(strtok(NULL, "#"));
+      journal_number = atoi(strtok(NULL, "#"));
+      pub_year = atoi(strtok(NULL, ")"));
+
+      EXEC SQL
+        INSERT INTO publication
+          VALUES (:pubid, :pub_title);
+
+      EXEC SQL
+        INSERT INTO journal
+          VALUES (:pubid, :journal_volume, :journal_number, :pub_year);
+
+      print_pub();
+
+    } else if (strcmp(insert_type, "proceedings") == 0) {
+      strcpy(pubid, strtok(NULL, "#"));
+      strcpy(pub_title, strtok(NULL, "#"));
+      pub_year = atoi(strtok(NULL, "#"));
+
+      EXEC SQL
+        INSERT INTO publication
+          VALUES (:pubid, :pub_title);
+
+      EXEC SQL
+        INSERT INTO proceedings
+          VALUES (:pubid, :pub_year);
+
+      print_pub();
+
+    } else if (strcmp(insert_type, "article") == 0) {
+      strcpy(pubid, strtok(NULL, "#"));
+      strcpy(pub_title, strtok(NULL, "#"));
+      strcpy(authors, strtok(NULL, "#"));
+      strcpy(article_appearsin, strtok(NULL, "#"));
+      article_startpage = atoi(strtok(NULL, "#"));
+      article_endpage = atoi(strtok(NULL, ")"));
+
+      EXEC SQL
+        INSERT INTO publication
+          VALUES (:pubid, :pub_title);
+
+      EXEC SQL
+        INSERT INTO article
+          VALUES (:pubid, :article_appearsin, :article_startpage, :article_endpage);
+
+      process_authors(authors);
+
+      print_pub();
+    }
+
+    free(authors);
+  }
+  free(buffer);
+
+  EXEC SQL COMMIT;
+  EXEC SQL CONNECT reset;
+  exit(0);
+
+error:
+  check_error("My error", &sqlca);
+  EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+  EXEC SQL ROLLBACK;
+  EXEC SQL CONNECT reset;
+  exit(EXIT_FAILURE);
+}
