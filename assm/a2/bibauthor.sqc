@@ -1,108 +1,201 @@
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
+#include <stdio.h>              // printf
+#include <stdlib.h>             // exit
+#include <string.h>             // strcpy, strlen
 #include "util.h"
 
+// Part of it borrowed from sample https://cs.uwaterloo.ca/~david/cs348/samples-esql-db2/adhoc.sqc
+
 EXEC SQL INCLUDE SQLCA;
-EXEC SQL INCLUDE SQLDA;
 
 EXEC SQL BEGIN DECLARE SECTION;
+  // char types are +1 in size to accommodate \0
   char db[6] = "cs348";
-  char sqlstmt[1000];
+  char input_author_name[23];
+  char pub_pubid[11];
+  char pub_title[71];
+  sqlint32 pub_year;              // only journal, proceedings, article
+  char pub_author_name[23];
+  char book_publisher[51];
+  sqlint32 journal_volume;
+  sqlint32 journal_number;
+  char article_appearsin[11];
+  sqlint32 article_startpage;
+  sqlint32 article_endpage;
 EXEC SQL END DECLARE SECTION;
 
-struct sqlda *slct;
+enum PUB_TYPE {BOOK = 0, JOURNAL, PROCEEDINGS, ARTICLE};
+typedef enum PUB_TYPE PUB_TYPE;
+const char *pub_type_names[] = {"book", "journal", "proceedings", "article"};
+
+PUB_TYPE load_publication() {
+  EXEC SQL
+    SELECT title INTO :pub_title
+    FROM publication
+    WHERE pubid = :pub_pubid;
+
+  EXEC SQL
+    SELECT publisher, year
+    INTO :book_publisher, :pub_year
+    FROM book
+    WHERE pubid = :pub_pubid;
+
+  if (SQLCODE == 0) return BOOK;
+
+  EXEC SQL
+    SELECT volume, number, year
+    INTO :journal_volume, :journal_number, :pub_year
+    FROM journal
+    WHERE pubid = :pub_pubid;
+
+  if (SQLCODE == 0) return JOURNAL;
+
+  EXEC SQL
+    SELECT year INTO :pub_year
+    FROM proceedings
+    WHERE pubid = :pub_pubid;
+
+  if (SQLCODE == 0) return PROCEEDINGS;
+
+  EXEC SQL
+    SELECT appearsin, startpage, endpage
+    INTO :article_appearsin, :article_startpage, :article_endpage
+    FROM article
+    WHERE pubid = :pub_pubid;
+
+  if (SQLCODE == 0) return ARTICLE;
+
+  exit(EXIT_FAILURE); // Should not happen
+}
+
+void print_authors() {
+  EXEC SQL DECLARE C_AUTHORS CURSOR FOR
+    SELECT rtrim(A.name) as name
+    FROM author AS A, wrote AS W
+    WHERE A.aid = W.aid
+      AND W.pubid = :pub_pubid
+    ORDER BY W.aorder ASC;
+  EXEC SQL OPEN C_AUTHORS;
+
+  printf("Authors: ");
+  for (int i = 0; ; i++) {
+      EXEC SQL FETCH C_AUTHORS INTO :pub_author_name;
+      if (SQLCODE == 100) break;
+      if (i > 0) printf(", ");
+      printf("%s", pub_author_name);
+  }
+  printf("\n");
+
+  EXEC SQL CLOSE C_AUTHORS;
+}
+
+void print_pub(PUB_TYPE type) {
+  printf("Pubid: %s\n", pub_pubid);
+  printf("Type: %s\n", pub_type_names[type]);
+  printf("Title: %s\n", pub_title);
+
+  switch (type) {
+    case BOOK:
+      print_authors();
+      printf("Publisher: %s\n", book_publisher);
+      printf("Year: %d\n", pub_year);
+      break;
+    case JOURNAL:
+      printf("Volume: %d\n", journal_volume);
+      printf("Number: %d\n", journal_number);
+      printf("Year: %d\n", pub_year);
+      break;
+    case PROCEEDINGS:
+      printf("Year: %d\n", pub_year);
+      break;
+    case ARTICLE:
+      print_authors();
+      printf("In: %s\n", article_appearsin);
+      printf("Pages: %d--%d\n", article_startpage, article_endpage);
+      break;
+  }
+
+  printf("\n");
+}
+
+void print_publications() {
+  EXEC SQL DECLARE C_PUBLICATIONS CURSOR FOR
+    WITH
+      author_view AS (
+        (
+          SELECT w1.pubid AS pubid, a2.name AS first_aname,
+            CASE
+              WHEN b.year IS NOT NULL THEN b.year
+              WHEN j.year IS NOT NULL THEN j.year
+              WHEN p.year IS NOT NULL THEN p.year
+            END AS year
+          FROM author AS a1, author AS a2, wrote AS w1, wrote AS w2
+            LEFT JOIN book AS b ON w1.pubid = b.pubid
+            LEFT JOIN journal AS j ON w1.pubid = j.pubid
+            LEFT JOIN proceedings AS p ON w1.pubid = p.pubid
+          WHERE a1.name = :input_author_name
+            AND a1.aid = w1.aid
+            AND w1.pubid = w2.pubid
+            AND w2.aorder = 1
+            AND w2.aid = a2.aid
+        ) UNION (
+          SELECT art.appearsin AS pubid,
+            (
+              SELECT a2.name
+              FROM author AS a2, wrote AS w2
+              WHERE
+                w2.aid = a2.aid
+                AND w2.aorder = 1
+                AND w2.pubid = art.appearsin
+                LIMIT 1
+            ) AS first_aname,
+            CASE
+              WHEN b.year IS NOT NULL THEN b.year
+              WHEN j.year IS NOT NULL THEN j.year
+              WHEN p.year IS NOT NULL THEN p.year
+            END AS year
+          FROM author AS a1, wrote AS w1, article AS art
+            LEFT JOIN book AS b ON art.appearsin = b.pubid
+            LEFT JOIN journal AS j ON art.appearsin = j.pubid
+            LEFT JOIN proceedings AS p ON art.appearsin = p.pubid
+          WHERE a1.name = :input_author_name
+            AND a1.aid = w1.aid
+            AND w1.pubid = art.pubid
+        )
+      )
+    SELECT pubid from author_view ORDER BY first_aname ASC, year DESC;
+  EXEC SQL OPEN C_PUBLICATIONS;
+
+  for (;;) {
+    EXEC SQL FETCH C_PUBLICATIONS INTO :pub_pubid;
+    if (SQLCODE == 100) break;
+    PUB_TYPE pub_type = load_publication();
+    print_pub(pub_type);
+  }
+
+  EXEC SQL CLOSE C_PUBLICATIONS;
+}
+
+void usage(char *argv[]) {
+    printf("Usage: %s AuthorName\n", argv[0]);
+    printf("len(AuthorName) <= 22\n");
+    exit(EXIT_FAILURE);
+}
 
 int main(int argc, char *argv[]) {
-  int i, isnull; short type;
-
-  printf("Sample C program : ADHOC interactive SQL\n");
+  /* Command line arg */
+  if (argc != 2 || strlen(argv[1]) > 22) {
+    usage(argv);
+  }
+  strcpy(input_author_name, argv[1]);
 
   /* bail out on error */
   EXEC SQL WHENEVER SQLERROR  GO TO error;
 
   /* connect to the database */
   EXEC SQL CONNECT TO :db;
-  printf("Connected to DB2\n");
 
-  strncpy(sqlstmt,argv[1],1000);
-  printf("Processing <%s>\n",sqlstmt);
+  print_publications();
 
-  /* compile the sql statement */
-  EXEC SQL PREPARE stmt FROM :sqlstmt;
-
-  init_da(&slct,1);
-
-  /* now we find out what it is */
-  EXEC SQL DESCRIBE stmt INTO :*slct;
-
-  i = slct->sqld;
-  if (i>0) {
-    printf("      ... looks like a query\n");
-
-    /* new SQLDA to hold enough descriptors for answer */
-    init_da(&slct,i);
-
-    /* get the names, types, etc... */
-    EXEC SQL DESCRIBE stmt INTO :*slct;
-
-    printf("Number of slct variables <%d>\n",slct->sqld);
-    for (i=0; i<slct->sqld; i++ ) {
-      printf("  variable %d <%.*s (%d%s [%d])>\n",
-                   i,
-                   slct->sqlvar[i].sqlname.length,
-                   slct->sqlvar[i].sqlname.data,
-                   slct->sqlvar[i].sqltype,
-                   ( (slct->sqlvar[i].sqltype&1)==1 ? "": " not null"),
-                   slct->sqlvar[i].sqllen);
-    }
-    printf("\n");
-
-    /* allocate buffers for the returned tuples */
-    for (i=0; i<slct->sqld; i++ ) {
-      slct->sqlvar[i].sqldata = malloc(slct->sqlvar[i].sqllen);
-      slct->sqlvar[i].sqlind = malloc(sizeof(short));
-      *slct->sqlvar[i].sqlind = 0;
-    }
-
-    /* and now process the query */
-    EXEC SQL DECLARE cstmt CURSOR FOR stmt;
-    EXEC SQL OPEN cstmt;
-    EXEC SQL WHENEVER NOT FOUND GO TO end;
-
-    /* print the header */
-    for (i=0; i<slct->sqld; i++ )
-      printf("%-*.*s ",slct->sqlvar[i].sqllen,
-                       slct->sqlvar[i].sqlname.length,
-                       slct->sqlvar[i].sqlname.data);
-    printf("\n");
-
-    for (;;) {
-      /* fetch next tuple into the prepared buffers */
-      EXEC SQL FETCH cstmt USING DESCRIPTOR :*slct;
-      for (i=0; i<slct->sqld; i++ )
-        if ( *(slct->sqlvar[i].sqlind) < 0 )
-          print_var("NULL",
-                    slct->sqlvar[i].sqltype,
-                    slct->sqlvar[i].sqlname.length,
-                    slct->sqlvar[i].sqllen);
-        else
-          print_var(slct->sqlvar[i].sqldata,
-                    slct->sqlvar[i].sqltype,
-                    slct->sqlvar[i].sqlname.length,
-                    slct->sqlvar[i].sqllen);
-      printf("\n");
-      };
-  end:
-    printf("\n");
-  } else {
-    printf("      ... looks like an update\n");
-
-    EXEC SQL EXECUTE stmt;
-  };
-  //printf("Rows processed: %d\n",sqlca.sqlerrd[2]);
-
-  /* and get out of here */
   EXEC SQL COMMIT;
   EXEC SQL CONNECT reset;
   exit(0);
@@ -113,5 +206,5 @@ error:
 
   EXEC SQL ROLLBACK;
   EXEC SQL CONNECT reset;
-  exit(1);
+  exit(EXIT_FAILURE);
 }
