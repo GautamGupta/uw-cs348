@@ -1,0 +1,9 @@
+A02 out-of 130
+Q1 testing  30  22
+Q1 transparency 10  10
+Q1 much SQL 10  10
+Q2 testing (bonus) 20  20
+Q3 testing  30  30
+Q3 transparency 10  10
+Q3 much SQL 10  10
+Total 100 112
